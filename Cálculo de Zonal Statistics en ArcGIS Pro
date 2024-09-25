@@ -1,0 +1,159 @@
+import arcpy
+from arcpy.sa import ExtractByMask, ZonalStatisticsAsTable
+import os
+
+# Configuración del entorno
+arcpy.env.overwriteOutput = True
+
+def reproyectar_raster_a_proyeccion_de_shape(raster_path, fishnet_path, output_raster_folder):
+    """Reproyecta el raster a la misma proyección que el fishnet y ajusta el tamaño de celda."""
+    try:
+        # Verificar que el raster de entrada exista
+        if not arcpy.Exists(raster_path):
+            print(f"El raster de entrada no existe: {raster_path}")
+            return None
+
+        # Obtener sistema de coordenadas del fishnet
+        shape_sr = arcpy.Describe(fishnet_path).spatialReference
+        print(f"Sistema de coordenadas del fishnet: {shape_sr.name}")
+        
+        raster_name = os.path.basename(raster_path).replace('.tif', '')
+        fishnet_name = os.path.basename(fishnet_path)
+        
+        # Definir ruta de salida para el raster reproyectado
+        output_raster_path = os.path.join(output_raster_folder, f"Project_{raster_name}_{fishnet_name}.tif")
+        
+        # Verificar si el nombre del archivo de salida es válido
+        if len(output_raster_path) > 255:
+            print("La ruta del archivo reproyectado es demasiado larga.")
+            return None
+        
+        # Reproyectar el raster
+        print(f"Reproyectando raster desde {raster_path} a {output_raster_path}...")
+        arcpy.management.ProjectRaster(raster_path, output_raster_path, shape_sr, "NEAREST")
+        print(f"Raster reproyectado guardado en: {output_raster_path}")
+        
+        # Verificar si el raster reproyectado existe
+        if not arcpy.Exists(output_raster_path):
+            print(f"El raster reproyectado no se encontró: {output_raster_path}")
+            return None
+
+        # Obtener el tamaño de celda del fishnet (usamos 1000 como referencia)
+        fishnet_cell_size = 1000  # Ajustar si es necesario
+
+        # Definir ruta para el raster reescalado
+        resampled_raster_path = os.path.join(output_raster_folder, f"Resampled_{raster_name}_{fishnet_name}.tif")
+        print(f"Reescalando raster a tamaño de celda {fishnet_cell_size}...")
+        arcpy.management.Resample(output_raster_path, resampled_raster_path, fishnet_cell_size, "NEAREST")
+        print(f"Raster reescalado guardado en: {resampled_raster_path}")
+        
+        # Verificar si el raster reescalado existe
+        if not arcpy.Exists(resampled_raster_path):
+            print(f"El raster reescalado no se encontró: {resampled_raster_path}")
+            return None
+
+        # Extraer raster usando el fishnet como máscara
+        extracted_raster_path = os.path.join(output_raster_folder, f"Extracted_{raster_name}_{fishnet_name}.tif")
+        print(f"Extrayendo raster usando máscara del fishnet...")
+        out_extract = ExtractByMask(resampled_raster_path, fishnet_path)
+        out_extract.save(extracted_raster_path)
+        print(f"Raster extraído guardado en: {extracted_raster_path}")
+
+        return extracted_raster_path
+
+    except arcpy.ExecuteError:
+        print(f"Error al reproyectar el raster: {arcpy.GetMessages()}")
+        return None
+
+def calcular_estadisticas_zonales_y_unir(fishnet_path, raster_path, gdb):
+    """Calcula estadísticas zonales y une los resultados a la feature class del fishnet."""
+    try:
+        # Definir ruta de salida para la tabla de estadísticas zonales
+        zonal_output_table = os.path.join(gdb, f"ZonalStats_{os.path.basename(fishnet_path)}")
+        
+        # Calcular las estadísticas zonales
+        print(f"Realizando estadísticas zonales usando 'ZoneID' como campo...")
+        arcpy.sa.ZonalStatisticsAsTable(
+            in_zone_data=fishnet_path,
+            zone_field="ZoneID",
+            in_value_raster=raster_path,
+            out_table=zonal_output_table,
+            statistics_type="MEAN",  # Cambia a "SUM" u otro tipo según necesidad
+        )
+        print(f"Estadísticas zonales calculadas y guardadas en: {zonal_output_table}")
+        
+        # Verificar campos de la tabla de estadísticas zonales
+        zonal_fields = [f.name for f in arcpy.ListFields(zonal_output_table)]
+        print(f"Campos de la tabla de estadísticas zonales: {zonal_fields}")
+
+        # Redondear y renombrar el campo de estadísticas zonales
+        nombre_campo_estadisticas = "MEAN"  # Campo de estadísticas zonales predeterminado
+        nuevo_nombre_campo = "POV_MEAN"
+        
+        if nombre_campo_estadisticas in zonal_fields:
+            renombrar_campo(zonal_output_table, nombre_campo_estadisticas, nuevo_nombre_campo)
+            print(f"Redondeando valores de '{nuevo_nombre_campo}' en {zonal_output_table}...")
+            arcpy.management.CalculateField(zonal_output_table, nuevo_nombre_campo, f"round(!{nuevo_nombre_campo}!, 2)", "PYTHON3")
+        
+        # Unir los resultados de estadísticas zonales al fishnet
+        print(f"Uniendo estadísticas zonales al fishnet...")
+        unir_estadisticas_fishnet(fishnet_path, zonal_output_table, nuevo_nombre_campo)
+        
+    except arcpy.ExecuteError:
+        print(f"Error al calcular estadísticas zonales o al unir al fishnet: {arcpy.GetMessages()}")
+
+def renombrar_campo(tabla, campo_viejo, campo_nuevo):
+    """
+    Renombra un campo en la tabla de estadísticas zonales.
+    """
+    print(f"Renombrando campo de '{campo_viejo}' a '{campo_nuevo}' en la tabla {tabla}...")
+    arcpy.management.AlterField(in_table=tabla, field=campo_viejo, new_field_name=campo_nuevo)
+    print(f"Campo renombrado de '{campo_viejo}' a '{campo_nuevo}'.")
+
+def unir_estadisticas_fishnet(fishnet_clipped, zonal_output_table, campo_nuevo):
+    print("Uniendo las estadísticas zonales al Fishnet...")
+    arcpy.management.JoinField(
+        in_data=fishnet_clipped,
+        in_field="ZoneID",
+        join_table=zonal_output_table,
+        join_field="ZoneID",
+        fields=[campo_nuevo]
+    )
+    print("Estadísticas unidas correctamente.")
+
+def procesar_fishnets(gdb, raster_path):
+    """Procesa todos los fishnets en la geodatabase."""
+    arcpy.env.workspace = gdb
+    fishnets = arcpy.ListFeatureClasses(feature_type='Polygon')
+    
+    # Carpeta para guardar los rasters generados
+    output_raster_folder = r"C:\\Users\\Dan\\OneDrive\\Escritorio\\Rasters_Reproyectados"
+    if not os.path.exists(output_raster_folder):
+        os.makedirs(output_raster_folder)
+    
+    for fishnet in fishnets:
+        fishnet_path = os.path.join(gdb, fishnet)
+        print(f"Procesando fishnet: {fishnet_path}")
+        
+        # Verificar si el campo 'ZoneID' ya existe, si no, agregarlo
+        fields = [f.name for f in arcpy.ListFields(fishnet_path)]
+        if 'ZoneID' not in fields:
+            arcpy.management.AddField(fishnet_path, 'ZoneID', 'LONG')
+            arcpy.management.CalculateField(fishnet_path, 'ZoneID', '!OBJECTID!', 'PYTHON3')
+            print(f"Campo 'ZoneID' agregado y calculado.")
+        else:
+            print(f"La columna 'ZoneID' ya existe en el fishnet.")
+        
+        # Reproyectar y reescalar el raster
+        raster_reproyectado = reproyectar_raster_a_proyeccion_de_shape(raster_path, fishnet_path, output_raster_folder)
+        
+        if raster_reproyectado:
+            # Calcular estadísticas zonales y unir los resultados
+            calcular_estadisticas_zonales_y_unir(fishnet_path, raster_reproyectado, gdb)
+
+if __name__ == "__main__":
+    # Define las rutas de la geodatabase y el raster
+    gdb = r"C:\\Users\\Dan\\OneDrive\\Escritorio\\UCR\\2024 II Ciclo\\Teledetección y modelación ambiental\\Caso 2\\Caso2\\Fishnets.gdb"
+    raster_path = r"C:\\Users\\Dan\\OneDrive\\Escritorio\\Rasters\\Pobreza.tif"
+
+    procesar_fishnets(gdb, raster_path)
